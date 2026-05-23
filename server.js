@@ -13,6 +13,7 @@ const JWT_SECRET = process.env.JWT_SECRET || 'bdviral_secret_2024';
 const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/bdviral';
 
 // Middleware
+app.use('/uploads', express.static('uploads'));
 app.use(cors());
 app.use(express.json());
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
