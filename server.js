@@ -137,6 +137,24 @@ app.put('/api/admin/password', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Change username
+app.put('/api/admin/username', auth, async (req, res) => {
+  try {
+    const { newUsername, currentPassword } = req.body;
+    if (!newUsername || newUsername.trim().length < 3)
+      return res.status(400).json({ error: 'Username কমপক্ষে ৩ অক্ষর হতে হবে' });
+    const admin = await Admin.findById(req.adminId);
+    if (!await bcrypt.compare(currentPassword, admin.password))
+      return res.status(400).json({ error: 'পাসওয়ার্ড ভুল' });
+    const exists = await Admin.findOne({ username: newUsername.trim() });
+    if (exists && exists._id.toString() !== req.adminId)
+      return res.status(400).json({ error: 'এই username আগেই আছে' });
+    admin.username = newUsername.trim();
+    await admin.save();
+    res.json({ message: 'Username আপডেট হয়েছে', username: admin.username });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // Upload thumbnail → Cloudinary
 app.post('/api/upload', auth, upload.single('thumbnail'), async (req, res) => {
   try {
