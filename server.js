@@ -13,11 +13,17 @@ const JWT_SECRET = process.env.JWT_SECRET || 'bdviral_secret_2024';
 const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/bdviral';
 
 // ===== CLOUDINARY CONFIG =====
-cloudinary.config({
-  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-  api_key:    process.env.CLOUDINARY_API_KEY,
-  api_secret: process.env.CLOUDINARY_API_SECRET,
-});
+// Accepts CLOUDINARY_URL=cloudinary://api_key:api_secret@cloud_name
+// OR separate CLOUDINARY_CLOUD_NAME / CLOUDINARY_API_KEY / CLOUDINARY_API_SECRET
+if (process.env.CLOUDINARY_URL) {
+  cloudinary.config(true); // auto-reads CLOUDINARY_URL
+} else {
+  cloudinary.config({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key:    process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET,
+  });
+}
 
 // Middleware
 app.use(cors());
