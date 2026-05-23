@@ -2,8 +2,8 @@ const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const multer = require('multer');
-const { v2: cloudinary } = require('cloudinary');
-const { CloudinaryStorage } = require('multer-storage-cloudinary');
+const cloudinary = require('cloudinary').v2;
+const streamifier = require('streamifier');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 
@@ -23,13 +23,12 @@ cloudinary.config({
 app.use(cors());
 app.use(express.json());
 
-// MongoDB Connection
+// MongoDB
 mongoose.connect(MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
   .then(() => console.log('MongoDB Connected'))
   .catch(err => console.log('MongoDB Error:', err));
 
 // ===== MODELS =====
-
 const adminSchema = new mongoose.Schema({
   username: { type: String, required: true, unique: true },
   password: { type: String, required: true },
@@ -38,8 +37,8 @@ const Admin = mongoose.model('Admin', adminSchema);
 
 const postSchema = new mongoose.Schema({
   title:     { type: String, required: true },
-  thumbnail: { type: String, required: true }, // Cloudinary full URL
-  publicId:  { type: String, default: '' },    // Cloudinary public_id for deletion
+  thumbnail: { type: String, required: true }, // full Cloudinary HTTPS URL
+  publicId:  { type: String, default: '' },    // Cloudinary public_id
   link:      { type: String, required: true },
   section: {
     type: String,
@@ -55,27 +54,39 @@ const postSchema = new mongoose.Schema({
 }, { timestamps: true });
 const Post = mongoose.model('Post', postSchema);
 
-// ===== MULTER + CLOUDINARY STORAGE =====
-const storage = new CloudinaryStorage({
-  cloudinary,
-  params: {
-    folder: 'bdviral-thumbnails',
-    allowed_formats: ['jpg', 'jpeg', 'png', 'gif', 'webp'],
-    transformation: [{ width: 640, height: 360, crop: 'fill', quality: 'auto' }],
-  },
-});
+// ===== MULTER (memory storage — no disk) =====
 const upload = multer({
-  storage,
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (/jpeg|jpg|png|gif|webp/.test(file.mimetype)) cb(null, true);
+    else cb(new Error('Only image files allowed'));
+  }
 });
 
+// ===== CLOUDINARY STREAM UPLOAD HELPER =====
+function uploadToCloudinary(buffer) {
+  return new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(
+      {
+        folder: 'bdviral-thumbnails',
+        transformation: [{ width: 640, height: 360, crop: 'fill', quality: 'auto:good' }]
+      },
+      (error, result) => {
+        if (error) return reject(error);
+        resolve(result);
+      }
+    );
+    streamifier.createReadStream(buffer).pipe(stream);
+  });
+}
+
 // ===== AUTH MIDDLEWARE =====
-const authMiddleware = (req, res, next) => {
+const auth = (req, res, next) => {
   const token = req.headers['authorization']?.split(' ')[1];
-  if (!token) return res.status(401).json({ error: 'No token provided' });
+  if (!token) return res.status(401).json({ error: 'No token' });
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    req.adminId = decoded.id;
+    req.adminId = jwt.verify(token, JWT_SECRET).id;
     next();
   } catch {
     res.status(401).json({ error: 'Invalid token' });
@@ -84,143 +95,126 @@ const authMiddleware = (req, res, next) => {
 
 // ===== ROUTES =====
 
-// Admin Login
+// First-time admin setup
+app.post('/api/admin/setup', async (req, res) => {
+  try {
+    if (await Admin.countDocuments() > 0)
+      return res.status(400).json({ error: 'Admin already exists' });
+    const hashed = await bcrypt.hash('admin123', 10);
+    await new Admin({ username: 'admin', password: hashed }).save();
+    res.json({ message: 'Done. Username: admin | Password: admin123' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Login
 app.post('/api/admin/login', async (req, res) => {
   try {
     const { username, password } = req.body;
     const admin = await Admin.findOne({ username });
-    if (!admin) return res.status(400).json({ error: 'Invalid credentials' });
-    const isMatch = await bcrypt.compare(password, admin.password);
-    if (!isMatch) return res.status(400).json({ error: 'Invalid credentials' });
+    if (!admin || !await bcrypt.compare(password, admin.password))
+      return res.status(400).json({ error: 'Invalid credentials' });
     const token = jwt.sign({ id: admin._id }, JWT_SECRET, { expiresIn: '7d' });
     res.json({ token, username: admin.username });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// First-time admin setup
-app.post('/api/admin/setup', async (req, res) => {
-  try {
-    const count = await Admin.countDocuments();
-    if (count > 0) return res.status(400).json({ error: 'Admin already exists' });
-    const hashed = await bcrypt.hash('admin123', 10);
-    await new Admin({ username: 'admin', password: hashed }).save();
-    res.json({ message: 'Admin created. Username: admin, Password: admin123' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // Change password
-app.put('/api/admin/password', authMiddleware, async (req, res) => {
+app.put('/api/admin/password', auth, async (req, res) => {
   try {
     const { currentPassword, newPassword } = req.body;
     const admin = await Admin.findById(req.adminId);
-    const isMatch = await bcrypt.compare(currentPassword, admin.password);
-    if (!isMatch) return res.status(400).json({ error: 'Current password wrong' });
+    if (!await bcrypt.compare(currentPassword, admin.password))
+      return res.status(400).json({ error: 'Current password wrong' });
     admin.password = await bcrypt.hash(newPassword, 10);
     await admin.save();
     res.json({ message: 'Password updated' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ===== UPLOAD to Cloudinary =====
-app.post('/api/upload', authMiddleware, upload.single('thumbnail'), (req, res) => {
-  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
-  res.json({
-    url:      req.file.path,       // full Cloudinary HTTPS URL — permanent
-    publicId: req.file.filename,   // Cloudinary public_id for deletion later
-  });
+// Upload thumbnail → Cloudinary
+app.post('/api/upload', auth, upload.single('thumbnail'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    const result = await uploadToCloudinary(req.file.buffer);
+    res.json({
+      url:      result.secure_url,  // permanent HTTPS URL
+      publicId: result.public_id,   // for deletion
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ===== PUBLIC ROUTES =====
-
+// Public: all posts
 app.get('/api/posts', async (req, res) => {
   try {
     const filter = { isActive: true };
     if (req.query.section) filter.section = req.query.section;
-    const posts = await Post.find(filter).sort({ order: 1, createdAt: -1 });
-    res.json(posts);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+    res.json(await Post.find(filter).sort({ order: 1, createdAt: -1 }));
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Public: grouped by section
 app.get('/api/posts/grouped', async (req, res) => {
   try {
     const posts = await Post.find({ isActive: true }).sort({ order: 1, createdAt: -1 });
     res.json({
-      most_popular:  posts.filter(p => p.section === 'most_popular'),
-      today_new:     posts.filter(p => p.section === 'today_new'),
-      trending_now:  posts.filter(p => p.section === 'trending_now'),
+      most_popular: posts.filter(p => p.section === 'most_popular'),
+      today_new:    posts.filter(p => p.section === 'today_new'),
+      trending_now: posts.filter(p => p.section === 'trending_now'),
     });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Track click
 app.post('/api/posts/:id/click', async (req, res) => {
   try {
     await Post.findByIdAndUpdate(req.params.id, { $inc: { views: 1 } });
     res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ===== ADMIN ROUTES =====
-
-app.get('/api/admin/posts', authMiddleware, async (req, res) => {
+// Admin: get posts
+app.get('/api/admin/posts', auth, async (req, res) => {
   try {
     const filter = {};
     if (req.query.section) filter.section = req.query.section;
-    const posts = await Post.find(filter).sort({ order: 1, createdAt: -1 });
-    res.json(posts);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+    res.json(await Post.find(filter).sort({ order: 1, createdAt: -1 }));
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/admin/posts', authMiddleware, async (req, res) => {
+// Admin: create post
+app.post('/api/admin/posts', auth, async (req, res) => {
   try {
     const { title, thumbnail, publicId, link, section, badge, isPremium, isNew, order } = req.body;
     const post = new Post({ title, thumbnail, publicId, link, section, badge, isPremium, isNew, order });
     await post.save();
     res.status(201).json(post);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.put('/api/admin/posts/:id', authMiddleware, async (req, res) => {
+// Admin: update post
+app.put('/api/admin/posts/:id', auth, async (req, res) => {
   try {
     const post = await Post.findByIdAndUpdate(req.params.id, req.body, { new: true });
-    if (!post) return res.status(404).json({ error: 'Post not found' });
+    if (!post) return res.status(404).json({ error: 'Not found' });
     res.json(post);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.delete('/api/admin/posts/:id', authMiddleware, async (req, res) => {
+// Admin: delete post
+app.delete('/api/admin/posts/:id', auth, async (req, res) => {
   try {
     const post = await Post.findById(req.params.id);
-    if (!post) return res.status(404).json({ error: 'Post not found' });
-    // Delete from Cloudinary
+    if (!post) return res.status(404).json({ error: 'Not found' });
     if (post.publicId) {
       try { await cloudinary.uploader.destroy(post.publicId); } catch {}
     }
     await post.deleteOne();
-    res.json({ message: 'Post deleted' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+    res.json({ message: 'Deleted' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/api/admin/stats', authMiddleware, async (req, res) => {
+// Admin: stats
+app.get('/api/admin/stats', auth, async (req, res) => {
   try {
     const total  = await Post.countDocuments();
     const active = await Post.countDocuments({ isActive: true });
@@ -228,9 +222,7 @@ app.get('/api/admin/stats', authMiddleware, async (req, res) => {
       { $group: { _id: '$section', count: { $sum: 1 }, totalViews: { $sum: '$views' } } }
     ]);
     res.json({ total, active, bySection });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
